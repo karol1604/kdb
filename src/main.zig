@@ -40,11 +40,39 @@ fn parseInput(input: []const u8, args_buf: [][]const u8) ParseError!ParsedComman
     };
 }
 
+fn appendToFile(io: std.Io, path: []const u8, data: []const u8) !void {
+    var file_exists = true;
+    std.Io.Dir.cwd().access(io, path, .{ .write = true }) catch |err| {
+        file_exists = err != std.Io.Dir.AccessError.FileNotFound;
+    };
+
+    var file: std.Io.File = undefined;
+
+    if (file_exists) {
+        file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    } else {
+        file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true });
+    }
+    defer file.close(io);
+
+    var write_buf: [4096]u8 = undefined;
+    var fw = file.writer(io, &write_buf);
+    const w = &fw.interface;
+
+    const file_len = try file.length(io);
+    try fw.seekTo(file_len);
+
+    try w.writeAll(data);
+    try w.flush();
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     const alloc = gpa.allocator();
     defer _ = gpa.deinit();
+
+    const log_file_path = "data.log";
 
     var stdout_buf: [1024]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buf);
@@ -58,6 +86,7 @@ pub fn main(init: std.process.Init) !void {
     defer {
         var entries = index.iterator();
         while (entries.next()) |entry| {
+            std.debug.print("Freeing key `{s}` and value `{s}`\n", .{ entry.key_ptr.*, entry.value_ptr.* });
             alloc.free(entry.key_ptr.*);
             alloc.free(entry.value_ptr.*);
         }
@@ -109,10 +138,19 @@ pub fn main(init: std.process.Init) !void {
                 const value = try alloc.dupe(u8, command_args[1]);
                 errdefer alloc.free(value);
 
-                if (try index.fetchPut(key, value)) |old| {
-                    alloc.free(old.key);
-                    alloc.free(old.value);
+                const res = try index.getOrPut(key);
+                if (!res.found_existing) {
+                    res.value_ptr.* = value;
+                } else {
+                    alloc.free(res.value_ptr.*);
+                    alloc.free(res.key_ptr.*);
+                    res.key_ptr.* = key;
+                    res.value_ptr.* = value;
                 }
+
+                const log_entry = try std.fmt.allocPrint(alloc, "SET {s} {s}\n", .{ key, value });
+                defer alloc.free(log_entry);
+                try appendToFile(io, log_file_path, log_entry);
             },
             .get => {
                 if (command_args.len != 1) {
@@ -138,6 +176,10 @@ pub fn main(init: std.process.Init) !void {
                     continue;
                 }
                 try stdout.print("ok\n", .{});
+
+                const log_entry = try std.fmt.allocPrint(alloc, "DELETE {s}\n", .{command_args[0]});
+                defer alloc.free(log_entry);
+                try appendToFile(io, log_file_path, log_entry);
             },
         }
 

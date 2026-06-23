@@ -1,0 +1,8 @@
+SET name karol
+SET age 21
+SET age 12
+DELETE name
+SET name karol
+SET name brian
+SET age 21
+DELETE name
