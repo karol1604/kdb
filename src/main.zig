@@ -21,7 +21,7 @@ const ParseError = error{
     TooManyArgs,
 };
 
-fn parseInput(input: []const u8, args_buf: [][]const u8) ParseError!ParsedCommand {
+fn parseCommand(input: []const u8, args_buf: [][]const u8) ParseError!ParsedCommand {
     var input_it = std.mem.tokenizeAny(u8, input, " \t\r\n");
     const command_str = input_it.next() orelse return error.EmptyInput;
 
@@ -66,6 +66,79 @@ fn appendToFile(io: std.Io, path: []const u8, data: []const u8) !void {
     try w.flush();
 }
 
+fn buildIndexFromLogFile(
+    io: std.Io,
+    path: []const u8,
+    index: *std.StringHashMap([]const u8),
+    alloc: std.mem.Allocator,
+) !void {
+    var file = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only }) catch |err| {
+        if (err == std.Io.File.OpenError.FileNotFound) {
+            return;
+        } else {
+            return err;
+        }
+    };
+    defer file.close(io);
+
+    var read_buf: [4096]u8 = undefined;
+    var fr = file.reader(io, &read_buf);
+    const r = &fr.interface;
+
+    var lines_read: usize = 0;
+
+    while (true) {
+        const line = r.takeDelimiterExclusive('\n') catch |err| {
+            if (err == std.Io.Reader.Error.EndOfStream) break;
+            return err;
+        };
+        r.toss(1);
+        if (line.len == 0) break;
+        lines_read += 1;
+        std.debug.print("Read line {d}: {s}\n", .{ lines_read, line });
+
+        var args: [2][]const u8 = undefined;
+        const parsed = parseCommand(line, &args) catch |err| switch (err) {
+            error.EmptyInput => continue,
+            error.UnknownCommand => continue,
+            error.TooManyArgs => continue,
+        };
+
+        const command = parsed.command;
+        const command_args = parsed.args;
+
+        switch (command) {
+            .set => {
+                if (command_args.len != 2) continue;
+
+                const key = try alloc.dupe(u8, command_args[0]);
+                errdefer alloc.free(key);
+                const value = try alloc.dupe(u8, command_args[1]);
+                errdefer alloc.free(value);
+
+                const res = try index.getOrPut(key);
+                if (!res.found_existing) {
+                    res.value_ptr.* = value;
+                } else {
+                    alloc.free(res.value_ptr.*);
+                    alloc.free(res.key_ptr.*);
+                    res.key_ptr.* = key;
+                    res.value_ptr.* = value;
+                }
+            },
+            .delete => {
+                if (command_args.len != 1) continue;
+
+                if (index.fetchRemove(command_args[0])) |old| {
+                    alloc.free(old.key);
+                    alloc.free(old.value);
+                }
+            },
+            else => {},
+        }
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     var gpa: std.heap.DebugAllocator(.{}) = .init;
@@ -83,6 +156,7 @@ pub fn main(init: std.process.Init) !void {
     const stdin = &stdin_reader.interface;
 
     var index = std.StringHashMap([]const u8).init(alloc);
+    try buildIndexFromLogFile(io, log_file_path, &index, alloc);
     defer {
         var entries = index.iterator();
         while (entries.next()) |entry| {
@@ -101,7 +175,7 @@ pub fn main(init: std.process.Init) !void {
         stdin.toss(1);
 
         var args: [2][]const u8 = undefined;
-        const parsed = parseInput(input, &args) catch |err| switch (err) {
+        const parsed = parseCommand(input, &args) catch |err| switch (err) {
             error.EmptyInput => {
                 try stdout.print("No command entered\n", .{});
                 continue;
@@ -148,7 +222,7 @@ pub fn main(init: std.process.Init) !void {
                     res.value_ptr.* = value;
                 }
 
-                const log_entry = try std.fmt.allocPrint(alloc, "SET {s} {s}\n", .{ key, value });
+                const log_entry = try std.fmt.allocPrint(alloc, "set {s} {s}\n", .{ key, value });
                 defer alloc.free(log_entry);
                 try appendToFile(io, log_file_path, log_entry);
             },
@@ -177,7 +251,7 @@ pub fn main(init: std.process.Init) !void {
                 }
                 try stdout.print("ok\n", .{});
 
-                const log_entry = try std.fmt.allocPrint(alloc, "DELETE {s}\n", .{command_args[0]});
+                const log_entry = try std.fmt.allocPrint(alloc, "delete {s}\n", .{command_args[0]});
                 defer alloc.free(log_entry);
                 try appendToFile(io, log_file_path, log_entry);
             },
@@ -189,7 +263,7 @@ pub fn main(init: std.process.Init) !void {
 
 test "parseInput ignores leading trailing and repeated whitespace" {
     var args: [2][]const u8 = undefined;
-    const parsed = try parseInput(" \t set   key\tvalue  \r", &args);
+    const parsed = try parseCommand(" \t set   key\tvalue  \r", &args);
 
     try std.testing.expectEqual(Command.set, parsed.command);
     try std.testing.expectEqual(@as(usize, 2), parsed.args.len);
@@ -199,7 +273,7 @@ test "parseInput ignores leading trailing and repeated whitespace" {
 
 test "parseInput handles single argument command" {
     var args: [2][]const u8 = undefined;
-    const parsed = try parseInput("get   key", &args);
+    const parsed = try parseCommand("get   key", &args);
 
     try std.testing.expectEqual(Command.get, parsed.command);
     try std.testing.expectEqual(@as(usize, 1), parsed.args.len);
@@ -209,6 +283,6 @@ test "parseInput handles single argument command" {
 test "parseInput rejects unknown commands and too many args" {
     var args: [2][]const u8 = undefined;
 
-    try std.testing.expectError(error.UnknownCommand, parseInput("wat key", &args));
-    try std.testing.expectError(error.TooManyArgs, parseInput("set key value extra", &args));
+    try std.testing.expectError(error.UnknownCommand, parseCommand("wat key", &args));
+    try std.testing.expectError(error.TooManyArgs, parseCommand("set key value extra", &args));
 }
