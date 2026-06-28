@@ -4,3 +4,14 @@ set city la
 set age 12
 delete city
 set age 21
+set city brussels
+set age 12
+set name josh
+set age 21
+set food pizza
+set name karol
+set test 1
+set test2 asd
+set foo bar
+set foo bar
+set bar baz
