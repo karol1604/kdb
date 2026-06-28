@@ -135,12 +135,12 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-const DbOptions = struct {
+pub const DbOptions = struct {
     log_file_path: []const u8,
     create_if_missing: bool = true,
 };
 
-const Db = struct {
+pub const Db = struct {
     alloc: std.mem.Allocator,
     index: std.StringHashMap([]const u8),
     state: enum {
@@ -183,7 +183,7 @@ const Db = struct {
             r.toss(1);
             if (line.len == 0) break;
             lines_read += 1;
-            std.debug.print("Read line {d}: {s}\n", .{ lines_read, line });
+            // std.debug.print("Read line {d}: {s}\n", .{ lines_read, line });
 
             var args: [2][]const u8 = undefined;
             const parsed = parseCommand(line, &args) catch |err| switch (err) {
@@ -236,9 +236,11 @@ const Db = struct {
     }
 
     pub fn close(self: *Db) void {
+        if (self.state == .closed) return;
+        self.state = .closed;
+
         var entries = self.index.iterator();
         while (entries.next()) |entry| {
-            std.debug.print("Freeing key: {s}, value: {s}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
             self.alloc.free(entry.key_ptr.*);
             self.alloc.free(entry.value_ptr.*);
         }
