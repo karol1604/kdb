@@ -6,10 +6,83 @@ fn testLogPath(alloc: std.mem.Allocator, tmp: std.testing.TmpDir, name: []const 
 }
 
 fn createDb(alloc: std.mem.Allocator, path: []const u8) !app.Db {
-    return app.Db.open(alloc, .{
+    return app.Db.open(alloc, std.testing.io, .{
         .log_file_path = path,
         .create_if_missing = true,
-    }, std.testing.io);
+    });
+}
+
+const ReplayedRecord = union(enum) {
+    set: struct {
+        key: []const u8,
+        value: []const u8,
+    },
+    delete: []const u8,
+};
+
+const ReplayCollector = struct {
+    alloc: std.mem.Allocator,
+    records: std.ArrayList(ReplayedRecord),
+
+    fn init(alloc: std.mem.Allocator) ReplayCollector {
+        return .{
+            .alloc = alloc,
+            .records = .empty,
+        };
+    }
+
+    fn deinit(self: *ReplayCollector) void {
+        for (self.records.items) |record| {
+            switch (record) {
+                .set => |entry| {
+                    self.alloc.free(entry.key);
+                    self.alloc.free(entry.value);
+                },
+                .delete => |key| self.alloc.free(key),
+            }
+        }
+        self.records.deinit(self.alloc);
+    }
+
+    fn apply(self: *ReplayCollector, record: app.Log.Record) !void {
+        switch (record) {
+            .set => |entry| try self.records.append(self.alloc, .{ .set = .{
+                .key = try self.alloc.dupe(u8, entry.key),
+                .value = try self.alloc.dupe(u8, entry.value),
+            } }),
+            .delete => |key| try self.records.append(self.alloc, .{
+                .delete = try self.alloc.dupe(u8, key),
+            }),
+        }
+    }
+};
+
+test "log replay emits valid records in order" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testLogPath(alloc, tmp, "log-replay.log");
+    defer alloc.free(path);
+
+    var log = try app.Log.open(alloc, std.testing.io, path, true);
+    defer log.close();
+
+    try log.appendPut("name", "karol");
+    try log.appendPut("age", "21");
+    try log.appendDelete("name");
+
+    var collector = ReplayCollector.init(alloc);
+    defer collector.deinit();
+
+    try log.replay(ReplayCollector, &collector, ReplayCollector.apply);
+
+    try std.testing.expectEqual(@as(usize, 3), collector.records.items.len);
+    try std.testing.expectEqualStrings("name", collector.records.items[0].set.key);
+    try std.testing.expectEqualStrings("karol", collector.records.items[0].set.value);
+    try std.testing.expectEqualStrings("age", collector.records.items[1].set.key);
+    try std.testing.expectEqualStrings("21", collector.records.items[1].set.value);
+    try std.testing.expectEqualStrings("name", collector.records.items[2].delete);
 }
 
 test "db set get exists and delete basic operations" {
@@ -122,10 +195,10 @@ test "open fails when log is missing and creation is disabled" {
     const path = try testLogPath(alloc, tmp, "does-not-exist.log");
     defer alloc.free(path);
 
-    try std.testing.expectError(error.FileNotFound, app.Db.open(alloc, .{
+    try std.testing.expectError(error.FileNotFound, app.Db.open(alloc, std.testing.io, .{
         .log_file_path = path,
         .create_if_missing = false,
-    }, std.testing.io));
+    }));
 }
 
 test "operations fail after close" {

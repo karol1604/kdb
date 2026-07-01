@@ -8,6 +8,7 @@ const Command = enum {
     set,
     get,
     delete,
+    lst,
 };
 
 const ParsedCommand = struct {
@@ -56,10 +57,10 @@ pub fn main(init: std.process.Init) !void {
     var stdin_reader = std.Io.File.stdin().readerStreaming(io, &stdin_buf);
     const stdin = &stdin_reader.interface;
 
-    var db = try Db.open(alloc, DbOptions{
+    var db = try Db.open(alloc, io, .{
         .log_file_path = log_file_path,
         .create_if_missing = true,
-    }, io);
+    });
     defer db.close();
 
     while (true) {
@@ -129,51 +130,107 @@ pub fn main(init: std.process.Init) !void {
                 };
                 try stdout.print("ok\n", .{});
             },
+            .lst => {
+                if (command_args.len != 0) {
+                    try stdout.print("Usage: lst\n", .{});
+                    continue;
+                }
+                var entries = db.index.iterator();
+                while (entries.next()) |entry| {
+                    try stdout.print("{s} -> {s}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+                }
+            },
         }
 
         try stdout.flush();
     }
 }
 
-pub const DbOptions = struct {
-    log_file_path: []const u8,
-    create_if_missing: bool = true,
-};
+pub const Log = struct {
+    pub const Record = union(enum) {
+        set: struct {
+            key: []const u8,
+            value: []const u8,
+        },
+        delete: []const u8,
+    };
 
-pub const Db = struct {
     alloc: std.mem.Allocator,
-    index: std.StringHashMap([]const u8),
-    state: enum {
-        open,
-        closed,
-    } = .closed,
+    file: std.Io.File,
+    path: []const u8,
     io: std.Io,
-    options: DbOptions,
 
-    pub fn open(alloc: std.mem.Allocator, options: DbOptions, io: std.Io) !Db {
+    pub fn open(
+        alloc: std.mem.Allocator,
+        io: std.Io,
+        path: []const u8,
+        create_if_no_exist: bool,
+    ) !Log {
         var file_exists = true;
-        std.Io.Dir.cwd().access(io, options.log_file_path, .{ .write = true }) catch |err| {
+        std.Io.Dir.cwd().access(io, path, .{ .write = true }) catch |err| {
             file_exists = err != std.Io.Dir.AccessError.FileNotFound;
         };
 
-        var file: std.Io.File = undefined;
-
+        var f: std.Io.File = undefined;
         if (file_exists) {
-            file = try std.Io.Dir.cwd().openFile(io, options.log_file_path, .{ .mode = .read_write });
-        } else if (options.create_if_missing) {
-            file = try std.Io.Dir.cwd().createFile(io, options.log_file_path, .{ .read = true });
+            f = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+        } else if (create_if_no_exist) {
+            f = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true });
         } else {
             return error.FileNotFound;
         }
-        defer file.close(io);
 
-        var index = std.StringHashMap([]const u8).init(alloc);
+        return Log{
+            .alloc = alloc,
+            .file = f,
+            .path = path,
+            .io = io,
+        };
+    }
 
+    pub fn close(self: *Log) void {
+        self.file.close(self.io);
+    }
+
+    pub fn appendPut(self: *Log, key: []const u8, value: []const u8) !void {
+        var write_buf: [4096]u8 = undefined;
+        var fw = self.file.writer(self.io, &write_buf);
+        const w = &fw.interface;
+
+        const log_entry = try std.fmt.allocPrint(self.alloc, "set {s} {s}\n", .{ key, value });
+        defer self.alloc.free(log_entry);
+
+        const file_len = try self.file.length(self.io);
+        try fw.seekTo(file_len);
+
+        try w.writeAll(log_entry);
+        try w.flush();
+    }
+
+    pub fn appendDelete(self: *Log, key: []const u8) !void {
+        var write_buf: [4096]u8 = undefined;
+        var fw = self.file.writer(self.io, &write_buf);
+        const w = &fw.interface;
+
+        const log_entry = try std.fmt.allocPrint(self.alloc, "delete {s}\n", .{key});
+        defer self.alloc.free(log_entry);
+
+        const file_len = try self.file.length(self.io);
+        try fw.seekTo(file_len);
+
+        try w.writeAll(log_entry);
+        try w.flush();
+    }
+
+    pub fn replay(
+        self: *Log,
+        comptime Ctx: type,
+        context: *Ctx,
+        comptime apply: fn (*Ctx, Record) anyerror!void,
+    ) !void {
         var read_buf: [4096]u8 = undefined;
-        var fr = file.reader(io, &read_buf);
+        var fr = self.file.reader(self.io, &read_buf);
         const r = &fr.interface;
-
-        var lines_read: usize = 0;
 
         while (true) {
             const line = r.takeDelimiterExclusive('\n') catch |err| {
@@ -182,8 +239,6 @@ pub const Db = struct {
             };
             r.toss(1);
             if (line.len == 0) break;
-            lines_read += 1;
-            // std.debug.print("Read line {d}: {s}\n", .{ lines_read, line });
 
             var args: [2][]const u8 = undefined;
             const parsed = parseCommand(line, &args) catch |err| switch (err) {
@@ -198,41 +253,51 @@ pub const Db = struct {
             switch (command) {
                 .set => {
                     if (command_args.len != 2) continue;
-
-                    const key = try alloc.dupe(u8, command_args[0]);
-                    errdefer alloc.free(key);
-                    const value = try alloc.dupe(u8, command_args[1]);
-                    errdefer alloc.free(value);
-
-                    const res = try index.getOrPut(key);
-                    if (!res.found_existing) {
-                        res.value_ptr.* = value;
-                    } else {
-                        alloc.free(res.value_ptr.*);
-                        alloc.free(res.key_ptr.*);
-                        res.key_ptr.* = key;
-                        res.value_ptr.* = value;
-                    }
+                    try apply(context, .{ .set = .{
+                        .key = command_args[0],
+                        .value = command_args[1],
+                    } });
                 },
                 .delete => {
                     if (command_args.len != 1) continue;
-
-                    if (index.fetchRemove(command_args[0])) |old| {
-                        alloc.free(old.key);
-                        alloc.free(old.value);
-                    }
+                    try apply(context, .{ .delete = command_args[0] });
                 },
                 else => {},
             }
         }
+    }
+};
 
-        return Db{
+pub const Db = struct {
+    const DbOptions = struct {
+        log_file_path: []const u8,
+        create_if_missing: bool = true,
+    };
+
+    alloc: std.mem.Allocator,
+    index: std.StringHashMap([]const u8),
+    log: Log,
+    state: enum {
+        open,
+        closed,
+    } = .closed,
+
+    pub fn open(alloc: std.mem.Allocator, io: std.Io, options: DbOptions) !Db {
+        var log = try Log.open(alloc, io, options.log_file_path, options.create_if_missing);
+        errdefer log.close();
+        const index = std.StringHashMap([]const u8).init(alloc);
+
+        var db = Db{
             .alloc = alloc,
             .index = index,
-            .options = options,
+            .log = log,
             .state = .open,
-            .io = io,
         };
+        errdefer db.close();
+
+        try db.log.replay(Db, &db, applyLogRecord);
+
+        return db;
     }
 
     pub fn close(self: *Db) void {
@@ -245,14 +310,17 @@ pub const Db = struct {
             self.alloc.free(entry.value_ptr.*);
         }
         self.index.deinit();
+        self.log.close();
     }
 
     pub fn set(self: *Db, key: []const u8, value: []const u8) !void {
         if (self.state != .open) return error.DbClosed;
-        const log_entry = try std.fmt.allocPrint(self.alloc, "set {s} {s}\n", .{ key, value });
-        defer self.alloc.free(log_entry);
-        try self.appendToFile(log_entry);
 
+        try self.log.appendPut(key, value);
+        try self.putInIndex(key, value);
+    }
+
+    fn putInIndex(self: *Db, key: []const u8, value: []const u8) !void {
         const key_copy = try self.alloc.dupe(u8, key);
         errdefer self.alloc.free(key_copy);
         const value_copy = try self.alloc.dupe(u8, value);
@@ -269,17 +337,19 @@ pub const Db = struct {
         }
     }
 
-    pub fn get(self: *Db, key: []const u8) ?[]const u8 {
+    pub fn get(self: *const Db, key: []const u8) ?[]const u8 {
         if (self.state != .open) return null;
         return self.index.get(key);
     }
 
     pub fn delete(self: *Db, key: []const u8) !bool {
         if (self.state != .open) return error.DbClosed;
-        const log_entry = try std.fmt.allocPrint(self.alloc, "delete {s}\n", .{key});
-        defer self.alloc.free(log_entry);
-        try self.appendToFile(log_entry);
+        try self.log.appendDelete(key);
 
+        return self.deleteFromIndex(key);
+    }
+
+    fn deleteFromIndex(self: *Db, key: []const u8) bool {
         if (self.index.fetchRemove(key)) |old| {
             self.alloc.free(old.key);
             self.alloc.free(old.value);
@@ -288,26 +358,16 @@ pub const Db = struct {
         return false;
     }
 
-    pub fn exists(self: *Db, key: []const u8) bool {
+    pub fn exists(self: *const Db, key: []const u8) bool {
         if (self.state != .open) return false;
         return self.index.get(key) != null;
     }
 
-    fn appendToFile(self: *Db, data: []const u8) !void {
-        var file = try std.Io.Dir.cwd().openFile(self.io, self.options.log_file_path, .{
-            .mode = .read_write,
-        });
-        defer file.close(self.io);
-
-        var write_buf: [4096]u8 = undefined;
-        var fw = file.writer(self.io, &write_buf);
-        const w = &fw.interface;
-
-        const file_len = try file.length(self.io);
-        try fw.seekTo(file_len);
-
-        try w.writeAll(data);
-        try w.flush();
+    fn applyLogRecord(self: *Db, record: Log.Record) !void {
+        switch (record) {
+            .set => |entry| try self.putInIndex(entry.key, entry.value),
+            .delete => |key| _ = self.deleteFromIndex(key),
+        }
     }
 };
 

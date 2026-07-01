@@ -15,3 +15,6 @@ set test2 asd
 set foo bar
 set foo bar
 set bar baz
+delete test
+delete test2
+delete foo
